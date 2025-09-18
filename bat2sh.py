@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""
+bat2sh - Convert Windows batch files (.cmd/.bat) to shell scripts (.sh)
+
+This script takes a Windows batch file as input and converts it to a POSIX-compliant
+shell script, handling various Windows batch commands and translating them to their
+shell script equivalents.
+"""
+
+import sys
+import re
+import os
+import argparse
+from pathlib import Path
+
+
+class BatchToShellConverter:
+    """Converts Windows batch files to shell scripts."""
+
+    def __init__(self):
+        self.variable_pattern = re.compile(r'%([^%]+)%')
+        self.set_pattern = re.compile(r'^\s*set\s+([^=]+)=(.*)$', re.IGNORECASE)
+        self.if_pattern = re.compile(r'^\s*if\s+(.+)\s+\(', re.IGNORECASE)
+        self.else_if_pattern = re.compile(r'^\s*\)\s*else\s*if\s+(.+)\s+\(', re.IGNORECASE)
+        self.else_pattern = re.compile(r'^\s*\)\s*else\s*\(', re.IGNORECASE)
+        self.end_block_pattern = re.compile(r'^\s*\)', re.IGNORECASE)
+        self.for_pattern = re.compile(r'^\s*for\s+(.+)\s+do\s+\(', re.IGNORECASE)
+        self.for_f_pattern = re.compile(r'^\s*for\s+/f\s+"([^"]+)"\s+%%(\w+)\s+in\s+\(([^)]+)\)\s+do\s+\(', re.IGNORECASE)
+        self.for_f_set_pattern = re.compile(r'^\s*for\s+/f\s+"([^"]+)"\s+%%(\w+)\s+in\s+\(([^)]+)\)\s+do\s+set\s+(\w+)=', re.IGNORECASE)
+        self.rem_pattern = re.compile(r'^\s*rem\s+(.*)$', re.IGNORECASE)
+        self.errorlevel_pattern = re.compile(r'errorlevel\s+(\d+)', re.IGNORECASE)
+        self.findstr_pattern = re.compile(r'findstr\s+(/\w+\s+)*([^\s>]+)(\s*>\s*NUL)?', re.IGNORECASE)
+        self.call_pattern = re.compile(r'^\s*call\s+(.+)$', re.IGNORECASE)
+        self.goto_pattern = re.compile(r'^\s*goto\s+(.+)$', re.IGNORECASE)
+        self.label_pattern = re.compile(r'^\s*:(\w+)\s*$')
+        self.array_pattern = re.compile(r'set\s+(\w+)\[(\d+|![\w]+!)\]=(.+)$', re.IGNORECASE)
+        self.array_access_pattern = re.compile(r'%(\w+)\[(\d+|![\w]+!)\]%')
+        self.set_a_pattern = re.compile(r'set\s+/a\s+(\w+)=(.+)$', re.IGNORECASE)
+        
+        # Track indentation level
+        self.indent_level = 0
+        
+        # Track block stack to handle nested structures
+        self.block_stack = []  # 'for', 'if', 'else', etc.
+        
+        # Track if we're inside a for loop
+        self.in_for_loop = False
+        self.for_loop_var = ""
+        self.for_loop_depth = 0
+        
+        # Track labels for goto statements
+        self.labels = set()
+        
+        # Track variables that are arrays
+        self.arrays = set()
+
+    def convert_line(self, line):
+        """Convert a single line of batch script to shell script."""
+        original_line = line
+        converted_lines = []
+        
+        # Handle comments (REM statements)
+        rem_match = self.rem_pattern.match(line)
+        if rem_match:
+            return [f"# {rem_match.group(1)}"]
+        
+        # Handle comments with ::
+        if line.strip().startswith("::"):
+            return [f"# {line.strip()[2:].strip()}"]
+            
+        # Handle labels
+        label_match = self.label_pattern.match(line)
+        if label_match:
+            label_name = label_match.group(1)
+            self.labels.add(label_name)
+            return [f"{label_name}() {{", "  :"]
+            
+        # Handle goto statements
+        goto_match = self.goto_pattern.match(line)
+        if goto_match:
+            label = goto_match.group(1)
+            return [f"{label}  # goto {label}"]
+            
+        # Handle call statements
+        call_match = self.call_pattern.match(line)
+        if call_match:
+            command = call_match.group(1)
+            # If it's calling a label, convert to function call
+            if command in self.labels:
+                return [f"{command}  # call {command}"]
+            else:
+                # Otherwise, it's probably calling an external command
+                return [command]
+        
+        # Handle for loops with direct variable assignment
+        for_f_set_match = self.for_f_set_pattern.match(line)
+        if for_f_set_match:
+            options = for_f_set_match.group(1)
+            var = for_f_set_match.group(2)
+            sources = for_f_set_match.group(3)
+            var_name = for_f_set_match.group(4)
+            
+            if sources.startswith("'") and sources.endswith("'"):
+                # This is a command substitution to set a variable
+                command = sources[1:-1]
+                # Convert Windows commands to Unix equivalents
+                command = self.convert_command(command)
+                return [f"{var_name}=$({command})"]
+        
+        # Handle regular for loops
+        for_f_match = self.for_f_pattern.match(line)
+        if for_f_match:
+            options = for_f_match.group(1)
+            var = for_f_match.group(2)
+            sources = for_f_match.group(3)
+            
+            # Parse options
+            tokens = None
+            delims = None
+            for opt in options.split():
+                if opt.startswith("tokens="):
+                    tokens = opt[7:]
+                elif opt.startswith("delims="):
+                    delims = opt[7:] if opt[7:] else " \t"
+            
+            self.in_for_loop = True
+            self.for_loop_var = var
+            self.for_loop_depth += 1
+            self.block_stack.append('for')
+            
+            # Handle different types of for /f loops
+            if sources.strip() == "*.txt":
+                converted = f"for file in *.txt; do\n"
+                converted += f"  while IFS= read -r {var}; do"
+                self.indent_level += 2
+                return [converted]
+            elif sources.startswith("'") and sources.endswith("'"):
+                # Command substitution
+                command = sources[1:-1]
+                
+                # Check if this is a variable assignment
+                var_assign_match = re.search(r'do\s+set\s+(\w+)=', line, re.IGNORECASE)
+                if var_assign_match:
+                    var_name = var_assign_match.group(1)
+                    # Convert Windows commands to Unix equivalents
+                    command = self.convert_command(command)
+                    return [f"{var_name}=$({command})"]
+                
+                # Regular command substitution for loop
+                command = self.convert_command(command)
+                
+                # Handle tokens if specified
+                if tokens:
+                    token_vars = []
+                    token_list = tokens.split(',')
+                    
+                    # Get the variable names for each token
+                    next_var_code = ord(var) + 1
+                    token_vars.append(var)
+                    
+                    for i in range(len(token_list) - 1):
+                        token_vars.append(chr(next_var_code))
+                        next_var_code += 1
+                    
+                    # Create the read command with proper field splitting
+                    if delims:
+                        delim_char = delims[0] if delims else " "
+                        read_cmd = f"while IFS='{delim_char}' read -r {' '.join(token_vars)}; do"
+                    else:
+                        read_cmd = f"while read -r {' '.join(token_vars)}; do"
+                    
+                    # Convert findstr to grep if present
+                    if "findstr" in command:
+                        command = self.convert_findstr(command)
+                    
+                    converted_lines.append(f"{command} | {read_cmd}")
+                else:
+                    # Convert findstr to grep if present
+                    if "findstr" in command:
+                        command = self.convert_findstr(command)
+                        
+                    converted_lines.append(f"{command} | while IFS= read -r {var}; do")
+                
+                self.indent_level += 1
+                return converted_lines
+            else:
+                # Assume it's a file or list
+                # Handle tokens if specified
+                if tokens:
+                    token_vars = []
+                    token_list = tokens.split(',')
+                    
+                    # Get the variable names for each token
+                    next_var_code = ord(var) + 1
+                    token_vars.append(var)
+                    
+                    for i in range(len(token_list) - 1):
+                        token_vars.append(chr(next_var_code))
+                        next_var_code += 1
+                    
+                    # Create the read command with proper field splitting
+                    if delims:
+                        delim_char = delims[0] if delims else " "
+                        read_cmd = f"while IFS='{delim_char}' read -r {' '.join(token_vars)}; do"
+                    else:
+                        read_cmd = f"while read -r {' '.join(token_vars)}; do"
+                    
+                    if "*" in sources:
+                        # It's a file pattern
+                        converted_lines.append(f"for file in {sources}; do")
+                        converted_lines.append(f"  cat &quot;$file&quot; | {read_cmd}")
+                        self.indent_level += 2
+                    else:
+                        # It's a specific file
+                        converted_lines.append(f"cat {sources} | {read_cmd}")
+                        self.indent_level += 1
+                else:
+                    if "*" in sources:
+                        # It's a file pattern
+                        converted_lines.append(f"for file in {sources}; do")
+                        converted_lines.append(f"  cat &quot;$file&quot; | while IFS= read -r {var}; do")
+                        self.indent_level += 2
+                    else:
+                        # It's a specific file
+                        converted_lines.append(f"cat {sources} | while IFS= read -r {var}; do")
+                        self.indent_level += 1
+                return converted_lines
+        
+        # Handle regular for loops
+        for_match = self.for_pattern.match(line)
+        if for_match:
+            for_params = for_match.group(1)
+            self.in_for_loop = True
+            self.for_loop_depth += 1
+            self.block_stack.append('for')
+            
+            # Check if it's a for loop with a range
+            if re.match(r'^\s*%\w+\s+in\s+\(\d+,\d+,\d+\)', for_params):
+                parts = re.match(r'^\s*%(\w+)\s+in\s+\((\d+),(\d+),(\d+)\)', for_params)
+                if parts:
+                    var = parts.group(1)
+                    start = parts.group(2)
+                    step = parts.group(3)
+                    end = parts.group(4)
+                    self.for_loop_var = var
+                    converted = f"for (( {var}={start}; {var}<={end}; {var}+={step} )); do"
+                    self.indent_level += 1
+                    return [converted]
+            
+            # Check if it's a for loop with explicit items
+            if re.match(r'^\s*%%\w+\s+in\s+\(.+\)', for_params):
+                parts = re.match(r'^\s*%%(\w+)\s+in\s+\((.+)\)', for_params)
+                if parts:
+                    var = parts.group(1)
+                    items = parts.group(2).split()
+                    self.for_loop_var = var
+                    converted = f"for {var} in {' '.join(items)}; do"
+                    self.indent_level += 1
+                    return [converted]
+            
+            # Default case
+            return [f"# Unsupported for loop: {line}", "for item in items; do"]
+        
+        # Handle if statements
+        if_match = self.if_pattern.match(line)
+        if if_match:
+            condition = if_match.group(1)
+            self.block_stack.append('if')
+            
+            # Handle errorlevel checks
+            errorlevel_match = self.errorlevel_pattern.search(condition)
+            if errorlevel_match:
+                level = errorlevel_match.group(1)
+                converted = f"if [ $? -ge {level} ]; then"
+                self.indent_level += 1
+                return [converted]
+            
+            # Handle file existence checks
+            if "exist" in condition.lower():
+                file_pattern = re.search(r'exist\s+([^\s)]+)', condition, re.IGNORECASE)
+                if file_pattern:
+                    file_path = file_pattern.group(1)
+                    file_path = self.convert_variables(file_path)
+                    converted = f"if [ -e {file_path} ]; then"
+                    self.indent_level += 1
+                    return [converted]
+            
+            # Handle string equality
+            eq_match = re.search(r'"([^"]+)"\s*==\s*"([^"]+)"', condition)
+            if eq_match:
+                left = eq_match.group(1)
+                right = eq_match.group(2)
+                left = self.convert_variables(left)
+                right = self.convert_variables(right)
+                converted = f"if [ &quot;{left}&quot; = &quot;{right}&quot; ]; then"
+                self.indent_level += 1
+                return [converted]
+            
+            # Handle variable equality with %%var in for loops
+            for_var_eq_match = re.search(r'%%(\w+)\s*==\s*(\d+|"[^"]+")', condition)
+            if for_var_eq_match and self.in_for_loop:
+                var = for_var_eq_match.group(1)
+                value = for_var_eq_match.group(2)
+                if value.startswith('"') and value.endswith('"'):
+                    converted = f"if [ &quot;${var}&quot; = {value} ]; then"
+                else:
+                    converted = f"if [ &quot;${var}&quot; -eq {value} ]; then"
+                self.indent_level += 1
+                return [converted]
+            
+            # Handle variable equality
+            var_eq_match = re.search(r'(%[^%]+%)\s*==\s*"([^"]+)"', condition)
+            if var_eq_match:
+                var = var_eq_match.group(1)
+                value = var_eq_match.group(2)
+                var = self.convert_variables(var)
+                converted = f"if [ &quot;{var}&quot; = &quot;{value}&quot; ]; then"
+                self.indent_level += 1
+                return [converted]
+            
+            # Handle NOT conditions
+            if condition.lower().startswith("not "):
+                rest_condition = condition[4:].strip()
+                # Recursively convert the rest of the condition
+                not_converted = self.convert_line(f"if {rest_condition} (")[0]
+                # Replace "if [ ... ]; then" with "if ! [ ... ]; then"
+                not_converted = not_converted.replace("if [", "if ! [")
+                return [not_converted]
+            
+            # Default case for if
+            return [f"if [ {self.convert_variables(condition)} ]; then"]
+        
+        # Handle else if statements
+        else_if_match = self.else_if_pattern.match(line)
+        if else_if_match:
+            condition = else_if_match.group(1)
+            self.indent_level -= 1
+            
+            # Pop the last block and push a new if block
+            if self.block_stack:
+                self.block_stack.pop()
+            self.block_stack.append('if')
+            
+            # Handle for loop variable equality
+            for_var_eq_match = re.search(r'%%(\w+)\s*==\s*(\d+|"[^"]+")', condition)
+            if for_var_eq_match and self.in_for_loop:
+                var = for_var_eq_match.group(1)
+                value = for_var_eq_match.group(2)
+                if value.startswith('"') and value.endswith('"'):
+                    converted = f"elif [ &quot;${var}&quot; = {value} ]; then"
+                else:
+                    converted = f"elif [ &quot;${var}&quot; -eq {value} ]; then"
+                self.indent_level += 1
+                return [converted]
+                
+            # Default else if
+            converted = f"elif [ {self.convert_variables(condition)} ]; then"
+            self.indent_level += 1
+            return [converted]
+            
+        # Handle else statements
+        if self.else_pattern.match(line):
+            self.indent_level -= 1
+            
+            # Pop the last block and push an else block
+            if self.block_stack:
+                self.block_stack.pop()
+            self.block_stack.append('else')
+            
+            converted = "else"
+            self.indent_level += 1
+            return [converted]
+            
+        # Handle closing parenthesis (end of block)
+        if self.end_block_pattern.match(line):
+            self.indent_level -= 1
+            
+            # Check what kind of block we're closing
+            if self.block_stack:
+                block_type = self.block_stack.pop()
+                
+                if block_type == 'for':
+                    self.for_loop_depth -= 1
+                    if self.for_loop_depth == 0:
+                        self.in_for_loop = False
+                        self.for_loop_var = ""
+                    return ["done"]
+                elif block_type in ('if', 'else'):
+                    return ["fi"]
+                else:
+                    return [f"# End of {block_type} block"]
+            else:
+                # If we don't know what block we're closing, assume it's an if
+                return ["fi"]
+        
+        # Handle set statements
+        set_match = self.set_pattern.match(line)
+        if set_match:
+            var_name = set_match.group(1).strip()
+            value = set_match.group(2).strip()
+            
+            # Handle array assignments
+            array_match = self.array_pattern.match(line)
+            if array_match:
+                array_name = array_match.group(1)
+                index = array_match.group(2)
+                value = array_match.group(3)
+                self.arrays.add(array_name)
+                
+                # Convert !var! style variables in index
+                if index.startswith("!") and index.endswith("!"):
+                    index = f"${{{index[1:-1]}}}"
+                
+                value = self.convert_variables(value)
+                return [f"{array_name}[{index}]={value}"]
+            
+            # Handle arithmetic operations
+            set_a_match = self.set_a_pattern.match(line)
+            if set_a_match or line.strip().lower().startswith("set /a "):
+                if set_a_match:
+                    var_name = set_a_match.group(1)
+                    expression = set_a_match.group(2)
+                else:
+                    # Handle the case where the regex didn't match but it's a set /a command
+                    parts = line.strip()[7:].split("=", 1)  # Skip "set /a "
+                    if len(parts) == 2:
+                        var_name = parts[0].strip()
+                        expression = parts[1].strip()
+                    else:
+                        # If there's no equals sign, it's just an expression
+                        var_name = "result"
+                        expression = parts[0].strip()
+                
+                # Convert increment/decrement operations
+                if "+=" in expression:
+                    parts = expression.split("+=")
+                    if len(parts) == 2:
+                        var = parts[0].strip()
+                        value = parts[1].strip()
+                        return [f"{var_name}=$(( ${var} + {value} ))"]
+                
+                # Convert other arithmetic operations
+                expression = self.convert_variables(expression)
+                expression = expression.replace("+=", "+").replace("-=", "-")
+                return [f"{var_name}=$(( {expression} ))"]
+            
+            # Regular variable assignment
+            value = self.convert_variables(value)
+            return [f"{var_name}={value}"]
+        
+        # Handle echo statements
+        if line.strip().lower().startswith("echo "):
+            text = line.strip()[5:].strip()
+            if text.lower() == "off":
+                return ["# echo off - no equivalent in shell"]
+            text = self.convert_variables(text)
+            return [f"echo {text}"]
+        
+        # Handle findstr commands
+        if "findstr" in line.lower():
+            converted = self.convert_findstr(line)
+            return [converted]
+        
+        # Convert variables in the line
+        line = self.convert_variables(line)
+        
+        # Fix escaped pipe
+        line = line.replace("^|", "|")
+        
+        # Fix NUL redirection
+        line = line.replace("> NUL", "> /dev/null")
+        line = line.replace(">NUL", ">/dev/null")
+        
+        # If nothing else matched, return the line as is
+        return [line]
+
+    def convert_variables(self, text):
+        """Convert %variable% syntax to $variable syntax."""
+        # First, handle special case of %%var in for loops
+        if self.in_for_loop:
+            # Match any %%letter pattern that might be a for loop variable
+            for match in re.finditer(r'%%(\w)', text):
+                var = match.group(1)
+                text = text.replace(f"%%{var}", f"${var}")
+        
+        # Handle array access
+        for array_match in self.array_access_pattern.finditer(text):
+            array_name = array_match.group(1)
+            index = array_match.group(2)
+            
+            # Convert !var! style variables in index
+            if index.startswith("!") and index.endswith("!"):
+                index = f"${{{index[1:-1]}}}"
+                
+            replacement = f"${{{array_name}[{index}]}}"
+            text = text.replace(array_match.group(0), replacement)
+            
+        # Handle array assignments with delayed expansion
+        array_assign_pattern = re.compile(r'set\s+(\w+)\[(![\w]+!)\]=(.+)', re.IGNORECASE)
+        for match in array_assign_pattern.finditer(text):
+            array_name = match.group(1)
+            index = match.group(2)
+            value = match.group(3)
+            
+            # Convert !var! style variables in index
+            if index.startswith("!") and index.endswith("!"):
+                index = f"${{{index[1:-1]}}}"
+                
+            replacement = f"{array_name}[{index}]={value}"
+            text = text.replace(match.group(0), replacement)
+        
+        # Handle environment variables
+        env_vars = {
+            "%CD%": "${PWD}",
+            "%ERRORLEVEL%": "$?",
+            "%PATH%": "${PATH}",
+            "%TEMP%": "${TMPDIR}",
+            "%TMP%": "${TMPDIR}",
+            "%USERPROFILE%": "${HOME}",
+            "%HOMEPATH%": "${HOME}",
+            "%USERNAME%": "${USER}",
+            "%COMPUTERNAME%": "${HOSTNAME}",
+            "%OS%": "${OSTYPE}",
+            "%RANDOM%": "${RANDOM}"
+        }
+        
+        for win_var, unix_var in env_vars.items():
+            text = text.replace(win_var, unix_var)
+        
+        # Handle regular variables
+        text = self.variable_pattern.sub(r'${\1}', text)
+        
+        # Handle !variable! syntax (delayed expansion)
+        text = re.sub(r'!([^!]+)!', r'${\1}', text)
+        
+        return text
+
+    def convert_command(self, command):
+        """Convert Windows commands to Unix equivalents."""
+        # Convert common Windows commands to Unix equivalents
+        if command.lower().startswith("type "):
+            return "cat " + command[5:]
+        elif "type " in command.lower():
+            # Handle type in the middle of a command
+            return command.lower().replace("type ", "cat ")
+        elif command.lower().startswith("dir "):
+            return "ls -l " + command[4:]
+        elif command.lower().startswith("date /t"):
+            return "date +&quot;%Y-%m-%d&quot;"
+        elif command.lower().startswith("time /t"):
+            return "date +&quot;%H:%M:%S&quot;"
+        elif "findstr" in command.lower():
+            return self.convert_findstr(command)
+        elif "^|" in command:
+            # Fix escaped pipe
+            return command.replace("^|", "|")
+        else:
+            return command
+            
+    def convert_findstr(self, line):
+        """Convert findstr commands to grep."""
+        findstr_match = self.findstr_pattern.search(line)
+        if not findstr_match:
+            return line
+            
+        options = findstr_match.group(1) or ""
+        pattern = findstr_match.group(2)
+        redirect_null = findstr_match.group(3) is not None
+        
+        grep_options = ""
+        if "/i" in options.lower():
+            grep_options += " -i"
+        if "/r" in options.lower():
+            # grep is regex by default
+            pass
+        
+        # Convert the pattern
+        if pattern.startswith('"') and pattern.endswith('"'):
+            pattern = pattern  # Keep quotes for grep
+        else:
+            pattern = f'"{pattern}"'
+        
+        # Replace the findstr command with grep
+        result = line.replace(findstr_match.group(0), f"grep{grep_options} {pattern}")
+        
+        # Handle redirection to NUL
+        if redirect_null:
+            result = result.replace("> NUL", "> /dev/null")
+            result = result.replace(">NUL", ">/dev/null")
+            
+        # Handle errorlevel checks that often follow findstr
+        if "errorlevel" in result.lower():
+            # In shell, grep returns 0 if match found, 1 if no match
+            # This is opposite to the errorlevel 1 check in batch
+            result = re.sub(r'if\s+errorlevel\s+1', "if [ $? -ne 0 ]", result, flags=re.IGNORECASE)
+            
+        return result
+
+    def convert(self, batch_content):
+        """Convert batch file content to shell script."""
+        batch_lines = batch_content.splitlines()
+        shell_lines = ["#!/bin/bash", ""]
+        
+        # First pass: collect all labels
+        for line in batch_lines:
+            label_match = self.label_pattern.match(line)
+            if label_match:
+                self.labels.add(label_match.group(1))
+        
+        # Second pass: convert each line
+        for line in batch_lines:
+            converted = self.convert_line(line)
+            for conv_line in converted:
+                if conv_line.strip():  # Skip empty lines
+                    indent = "  " * self.indent_level
+                    shell_lines.append(f"{indent}{conv_line}")
+                else:
+                    shell_lines.append("")
+        
+        # Add function end markers for any labels
+        if self.labels:
+            shell_lines.append("")
+            shell_lines.append("# Call the main function if directly executed")
+            shell_lines.append("if [[ &quot;${BASH_SOURCE[0]}&quot; == &quot;${0}&quot; ]]; then")
+            shell_lines.append("  # Call the first label/function as the entry point")
+            if self.labels:
+                shell_lines.append(f"  {next(iter(self.labels))}")
+            shell_lines.append("fi")
+            
+            # Add closing braces for all label functions
+            for label in self.labels:
+                shell_lines.append("")
+                shell_lines.append(f"}} # End of {label} function")
+        
+        return "\n".join(shell_lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Convert Windows batch files to shell scripts.')
+    parser.add_argument('input_file', help='Input batch file (.cmd or .bat)')
+    parser.add_argument('-o', '--output', help='Output shell script file (.sh)')
+    parser.add_argument('-f', '--force', action='store_true', help='Overwrite output file if it exists')
+    
+    args = parser.parse_args()
+    
+    # Check if input file exists
+    if not os.path.isfile(args.input_file):
+        print(f"Error: Input file '{args.input_file}' not found.", file=sys.stderr)
+        return 1
+    
+    # Determine output filename if not specified
+    if not args.output:
+        input_path = Path(args.input_file)
+        args.output = str(input_path.with_suffix('.sh'))
+    
+    # Check if output file already exists
+    if os.path.exists(args.output) and not args.force:
+        print(f"Error: Output file '{args.output}' already exists. Use -f to overwrite.", file=sys.stderr)
+        return 1
+    
+    # Read input file
+    try:
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            batch_content = f.read()
+    except Exception as e:
+        print(f"Error reading input file: {e}", file=sys.stderr)
+        return 1
+    
+    # Convert batch to shell
+    converter = BatchToShellConverter()
+    shell_content = converter.convert(batch_content)
+    
+    # Write output file
+    try:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(shell_content)
+        
+        # Make the output file executable
+        os.chmod(args.output, 0o755)
+        
+        print(f"Successfully converted '{args.input_file}' to '{args.output}'")
+    except Exception as e:
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

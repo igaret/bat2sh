@@ -1,0 +1,60 @@
+.TH bat2sh 1 "September 2025" "bat2sh 1.0" "User Commands"
+.SH NAME
+bat2sh, bat2sh \- convert Windows batch files to shell scripts
+.SH SYNOPSIS
+.B bat2sh
+[\fIOPTIONS\fR]
+\fIINPUT_FILE\fR
+.SH DESCRIPTION
+.B bat2sh
+converts Windows batch files (.cmd/.bat) to POSIX-compliant shell scripts (.sh).
+It handles common batch commands like if, for, set, echo, etc., and translates
+them to their shell script equivalents.
+.SH OPTIONS
+.TP
+.BR \-o ", " \-\-output =\fIFILE\fR
+Specify output file (default: input file with .sh extension)
+.TP
+.BR \-f ", " \-\-force
+Overwrite output file if it exists
+.SH EXAMPLES
+.TP
+Convert a batch file to a shell script:
+.B bat2sh script.bat
+.TP
+Specify output file:
+.B bat2sh script.bat -o converted_script.sh
+.TP
+Force overwrite:
+.B bat2sh script.bat -f
+.SH SUPPORTED CONVERSIONS
+.TS
+tab(@);
+l l.
+Batch Command@Shell Equivalent
+_@_
+echo text@echo text
+set var=value@var=value
+set /a var=expr@var=$(( expr ))
+if condition (commands)@if [ condition ]; then commands; fi
+if condition (cmds) else (cmds)@if [ condition ]; then cmds; else cmds; fi
+for %%i in (items) do (cmds)@for i in items; do cmds; done
+for /f "options" %%i in (source) do (cmds)@cat source | while read -r i; do cmds; done
+rem comment@# comment
+findstr pattern@grep pattern
+errorlevel@$?
+%var%@${var}
+array[index]=value@array[index]=value
+.TE
+.SH LIMITATIONS
+.IP \[bu] 2
+Complex batch scripts with goto statements may not convert perfectly
+.IP \[bu] 2
+Some advanced batch features might require manual adjustment
+.IP \[bu] 2
+Windows-specific commands will need to be replaced manually
+.SH AUTHOR
+NinjaTech AI Team
+.SH SEE ALSO
+.BR bash (1),
+.BR sh (1)
