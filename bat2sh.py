@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-bat2sh - Convert Windows batch files (.cmd/.bat) to shell scripts (.sh)
+bat2sh / cmd2sh v0.1.1 [250918]
 
+author: garet mccallister @github.com/igaret
+
+Convert Windows batch files (.cmd/.bat) to shell scripts (.sh)
 This script takes a Windows batch file as input and converts it to a POSIX-compliant
 shell script, handling various Windows batch commands and translating them to their
 shell script equivalents.
